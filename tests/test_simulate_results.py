@@ -9,6 +9,10 @@ from casino_sim.simulation.standard_blackjack_parallel import ParallelParticipan
 
 
 def _row(**kwargs) -> ParallelParticipantSummary:
+    fb = kwargs.get("final_bankroll", 0.0)
+    kwargs.setdefault("min_bankroll", fb)
+    kwargs.setdefault("max_bankroll", fb)
+    kwargs.setdefault("bankroll_after_each_round", ())
     base = ParallelParticipantSummary(
         name="X",
         final_bankroll=0.0,
@@ -20,6 +24,11 @@ def _row(**kwargs) -> ParallelParticipantSummary:
         wins=0,
         losses=0,
         pushes=0,
+        min_bankroll=0.0,
+        max_bankroll=0.0,
+        bankroll_after_each_round=(),
+        block_bonus_net=0.0,
+        lucky_queens_net=0.0,
     )
     return replace(base, **kwargs)
 
@@ -100,6 +109,76 @@ class SimulateResultsFormatTests(unittest.TestCase):
         lines, _ = results_table_lines(summaries, initial_bankroll=10000.0)
         data = lines[2]
         self.assertIn("-$2,500.00", data)
+
+    def test_strategy_column_fits_longest_name_without_truncation(self) -> None:
+        long_name = "Hoyle - Block high / Lucky mid"
+        summaries = [
+            _row(
+                name=long_name,
+                final_bankroll=1000.0,
+                total_wagered=0.0,
+                total_won=0.0,
+                rounds_played=1,
+                busted_on_round=None,
+                hand_busts=0,
+                wins=0,
+                losses=0,
+                pushes=0,
+            )
+        ]
+        lines, _ = results_table_lines(summaries, 1000.0)
+        self.assertTrue(lines[0].startswith("Strategy Name"))
+        self.assertIn(long_name, lines[2])
+        self.assertNotIn("…", lines[2])
+        self.assertEqual(len(lines[0]), len(lines[2]))
+
+    def test_rows_sorted_by_final_bankroll_descending(self) -> None:
+        low = _row(name="Low", final_bankroll=100.0, rounds_played=1)
+        high = _row(name="High", final_bankroll=999.0, rounds_played=1)
+        lines, _ = results_table_lines([low, high], initial_bankroll=500.0)
+        self.assertIn("High", lines[2])
+        self.assertIn("Low", lines[3])
+
+    def test_side_bet_net_columns_extend_table(self) -> None:
+        summaries = [
+            _row(
+                name="P",
+                final_bankroll=1000.0,
+                total_wagered=0.0,
+                total_won=0.0,
+                rounds_played=1,
+                busted_on_round=None,
+                hand_busts=0,
+                wins=0,
+                losses=0,
+                pushes=0,
+                block_bonus_net=12.5,
+                lucky_queens_net=-5.0,
+            )
+        ]
+        lines, sep_w = results_table_lines(
+            summaries, 1000.0, include_side_bet_nets=True
+        )
+        self.assertEqual(len(lines[0]), sep_w)
+        header = lines[0]
+        self.assertIn("Block Bonus Net", header)
+        self.assertIn("Lucky Queens Net", header)
+        self.assertLess(
+            header.index("Block Bonus Net"),
+            header.index("Min Bankroll"),
+            "side bet nets should appear before Min Bankroll",
+        )
+        self.assertLess(
+            header.index("Min Bankroll"),
+            header.index("Final Total"),
+            "Min/Max Bankroll should appear before Final Total",
+        )
+        self.assertLess(
+            header.index("Max Bankroll"),
+            header.index("Final Total"),
+        )
+        self.assertIn("$12.50", lines[2])
+        self.assertIn("-$5.00", lines[2])
 
 
 if __name__ == "__main__":

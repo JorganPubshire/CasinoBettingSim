@@ -276,6 +276,28 @@ class ParallelBlackjackSessionTests(unittest.TestCase):
         self.assertEqual(summary.final_bankroll, 510.0)
         self.assertEqual((summary.wins, summary.losses, summary.pushes), (1, 0, 0))
 
+    def test_bankroll_snapshots_each_round_and_extrema(self) -> None:
+        random.seed(1)
+        stander = AlwaysMinBetStandStrategy()
+        rounds = 3
+        init = 500.0
+        session = StandardBlackjackParallelSession(
+            bet_min=10,
+            bet_max=100,
+            initial_bankroll=init,
+            rounds=rounds,
+            strategies=[("p", stander)],
+            deck_count=1,
+            include_slug=False,
+        )
+        summary = session.run()[0]
+        self.assertEqual(len(summary.bankroll_after_each_round), rounds)
+        self.assertEqual(summary.bankroll_after_each_round[-1], summary.final_bankroll)
+        self.assertLessEqual(summary.min_bankroll, summary.final_bankroll)
+        self.assertGreaterEqual(summary.max_bankroll, summary.final_bankroll)
+        self.assertLessEqual(summary.min_bankroll, init + 1e-9)
+        self.assertGreaterEqual(summary.max_bankroll, init - 1e-9)
+
     def test_hand_busts_count_player_hands_over_21(self) -> None:
         random.seed(0)
         hitter = HitOnceThenStandStrategy()

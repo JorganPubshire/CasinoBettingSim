@@ -1,3 +1,5 @@
+"""Parallel session for Lucky Queens blackjack (main hand + Block Bonus + Lucky Queens side bets)."""
+
 from __future__ import annotations
 
 import copy
@@ -5,69 +7,56 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from casino_sim.games.blackjack import Blackjack, BlackjackBranchOutcome
-from casino_sim.models.card import Card
+from casino_sim.games.blackjack import Blackjack
+from casino_sim.games.lucky_queens_blackjack import (
+    LuckyQueensBlackjack,
+    LuckyQueensBranchOutcome,
+)
 from casino_sim.models.player import Player
 from casino_sim.round_debug import ParallelRoundDebugRecorder
+from casino_sim.simulation.standard_blackjack_parallel import (
+    ParallelParticipantSummary,
+    canonical_exposure_suffix,
+)
 from casino_sim.strategies.blackjack.standard.base import StandardBlackjackPlayerStrategy
 
-
-def canonical_exposure_suffix(
-    branch_dealt: list[Card], canonical_dealt: list[Card]
-) -> list[Card]:
-    """Cards from the canonical sequence after the longest common prefix with ``branch_dealt``."""
-    k = 0
-    n, m = len(branch_dealt), len(canonical_dealt)
-    while k < n and k < m and branch_dealt[k] == canonical_dealt[k]:
-        k += 1
-    return list(canonical_dealt[k:])
+# Side-bet ids for this variant (strategies and CLI/registry use these keys).
+SIDE_BET_BLOCK_BONUS = "block_bonus"
+SIDE_BET_LUCKY_QUEENS = "lucky_queens"
 
 
-@dataclass
-class ParallelParticipantSummary:
-    """
-    ``busted_on_round`` is the first round bankroll fell below the table minimum (cannot
-    bet further), not a count of blackjack hand busts. See ``hand_busts`` for 21 busts.
-
-    ``wins`` / ``losses`` / ``pushes`` count each resolved player hand (splits can add
-    several per table round). ``rounds_played`` counts only rounds where the strategy
-    placed a legal wager (bankroll was at least table minimum and ante was valid).
-
-    ``bankroll_after_each_round`` holds bankroll after each scheduled session round
-    (same length as ``rounds`` on the parallel session), for plotting. ``min_bankroll`` /
-    ``max_bankroll`` include the starting bankroll and every post-round snapshot.
-    """
-
-    name: str
-    final_bankroll: float
-    total_wagered: float
-    total_won: float
-    rounds_played: int
-    busted_on_round: int | None
-    hand_busts: int
-    wins: int
-    losses: int
-    pushes: int
-    min_bankroll: float
-    max_bankroll: float
-    bankroll_after_each_round: tuple[float, ...] = ()
-    block_bonus_net: float = 0.0
-    lucky_queens_net: float = 0.0
+def _validated_side_stake(
+    proposed: float,
+    bankroll: float,
+    lo: float,
+    hi: float,
+) -> float:
+    """Return a legal stake or 0 if the proposal is out of range or unaffordable."""
+    if hi <= 0:
+        return 0.0
+    if lo < 0 or hi < lo:
+        return 0.0
+    a = float(proposed)
+    if a <= 0:
+        return 0.0
+    if a + 1e-9 < lo or a > hi + 1e-9:
+        return 0.0
+    return min(a, float(bankroll))
 
 
 @dataclass
-class StandardBlackjackParallelSession:
+class LuckyQueensParallelSession:
     """
-    Compare many strategies against the same dealer shoe in one conceptual seat.
+    Same deal-equality model as :class:`StandardBlackjackParallelSession`, using
+    :class:`LuckyQueensBlackjack`.
 
-    Each round: the master shoe deals one shared four-card start (player, player, dealer,
-    dealer). Every active strategy gets an **independent clone** of the remaining deck—same
-    card order—then plays the hand against the same upcards. Strategies that hit, split, or
-    extend the dealer run **further down that identical stream** than others.
+    ``side_bet_limits`` maps side-bet ids (e.g. :data:`SIDE_BET_BLOCK_BONUS`) to
+    ``(minimum, maximum)`` wagers allowed on the table. Each strategy chooses stakes
+    via :meth:`~casino_sim.interfaces.player_strategy.PlayerStrategy.place_side_bets_before_deal`;
+    invalid proposals are treated as zero.
 
-    After all branches finish, the master shoe is replaced with the clone that has the
-    **fewest cards remaining** (the deepest penetration into the shared stream for that
-    round). Exposure callbacks use that branch's dealt sequence as canonical.
+    Strategies must report :attr:`LuckyQueensBlackjack.GAME_ID` from
+    ``supported_game_id`` (standard blackjack strategies are not valid here).
     """
 
     bet_min: float
@@ -75,6 +64,7 @@ class StandardBlackjackParallelSession:
     initial_bankroll: float
     rounds: int
     strategies: list[tuple[str, StandardBlackjackPlayerStrategy]]
+    side_bet_limits: dict[str, tuple[float, float]] = field(default_factory=dict)
     deck_count: int = 6
     include_slug: bool = False
     dealer_hits_soft_17: bool = True
@@ -83,23 +73,41 @@ class StandardBlackjackParallelSession:
     debug_parallel: bool = False
     on_progress: Callable[[int, int], None] | None = None
 
-    _master: Blackjack = field(init=False, repr=False)
+    _master: LuckyQueensBlackjack = field(init=False, repr=False)
     _players: list[Player] = field(init=False, repr=False)
     _bust_round: dict[int, int | None] = field(init=False, repr=False)
     _rounds_played: list[int] = field(init=False, repr=False)
+    _wins: list[int] = field(init=False, repr=False)
+    _losses: list[int] = field(init=False, repr=False)
+    _pushes: list[int] = field(init=False, repr=False)
+    _block_net: list[float] = field(init=False, repr=False)
+    _lq_net: list[float] = field(init=False, repr=False)
+    _min_bankroll_track: list[float] = field(init=False, repr=False)
+    _max_bankroll_track: list[float] = field(init=False, repr=False)
+    _bankroll_history: list[list[float]] = field(init=False, repr=False)
+    _side_bet_limits: dict[str, tuple[float, float]] = field(init=False, repr=False)
     _debug_recorder: ParallelRoundDebugRecorder | None = field(
         default=None, init=False, repr=False
     )
 
     def __post_init__(self) -> None:
+        lq_id = LuckyQueensBlackjack.GAME_ID
         for _label, strategy in self.strategies:
-            if strategy.supported_game_id != Blackjack.GAME_ID:
+            if strategy.supported_game_id != lq_id:
                 raise ValueError(
-                    f"Strategy {strategy!r} is not built for {Blackjack.GAME_ID!r} "
-                    f"(reports {strategy.supported_game_id!r})."
+                    f"Strategy {strategy!r} is not built for Lucky Queens blackjack "
+                    f"(need {lq_id!r}, reports {strategy.supported_game_id!r})."
                 )
 
-        self._master = Blackjack(
+        self._side_bet_limits = dict(self.side_bet_limits)
+        for key, pair in self._side_bet_limits.items():
+            lo, hi = pair
+            if lo < 0 or hi < lo:
+                raise ValueError(
+                    f"invalid side bet limits for {key!r}: minimum={lo} maximum={hi}"
+                )
+
+        self._master = LuckyQueensBlackjack(
             bet_min=self.bet_min,
             bet_max=self.bet_max,
             deck_count=self.deck_count,
@@ -113,19 +121,21 @@ class StandardBlackjackParallelSession:
             Player(name=label, bankroll=float(self.initial_bankroll), strategy=strategy)
             for label, strategy in self.strategies
         ]
-        self._bust_round = {i: None for i in range(len(self._players))}
-        self._rounds_played = [0 for _ in self._players]
-        self._wins = [0 for _ in self._players]
-        self._losses = [0 for _ in self._players]
-        self._pushes = [0 for _ in self._players]
+        n = len(self._players)
+        self._bust_round = {i: None for i in range(n)}
+        self._rounds_played = [0] * n
+        self._wins = [0] * n
+        self._losses = [0] * n
+        self._pushes = [0] * n
+        self._block_net = [0.0] * n
+        self._lq_net = [0.0] * n
         init_br = float(self.initial_bankroll)
-        self._min_bankroll_track = [init_br for _ in self._players]
-        self._max_bankroll_track = [init_br for _ in self._players]
-        self._bankroll_history = [[] for _ in self._players]
-        if self.debug_parallel:
-            self._debug_recorder = ParallelRoundDebugRecorder()
-        else:
-            self._debug_recorder = None
+        self._min_bankroll_track = [init_br] * n
+        self._max_bankroll_track = [init_br] * n
+        self._bankroll_history = [[] for _ in range(n)]
+        self._debug_recorder = (
+            ParallelRoundDebugRecorder() if self.debug_parallel else None
+        )
 
     def run(self) -> list[ParallelParticipantSummary]:
         try:
@@ -154,8 +164,8 @@ class StandardBlackjackParallelSession:
                 min_bankroll=self._min_bankroll_track[i],
                 max_bankroll=self._max_bankroll_track[i],
                 bankroll_after_each_round=tuple(self._bankroll_history[i]),
-                block_bonus_net=0.0,
-                lucky_queens_net=0.0,
+                block_bonus_net=self._block_net[i],
+                lucky_queens_net=self._lq_net[i],
             )
             for i, p in enumerate(self._players)
         ]
@@ -166,6 +176,22 @@ class StandardBlackjackParallelSession:
             self._bankroll_history[i].append(b)
             self._min_bankroll_track[i] = min(self._min_bankroll_track[i], b)
             self._max_bankroll_track[i] = max(self._max_bankroll_track[i], b)
+
+    def _resolve_side_stakes(self, player: Player, wager: int) -> tuple[float, float]:
+        limits = self._side_bet_limits
+        proposed = player.strategy.place_side_bets_before_deal(
+            bankroll=float(player.bankroll),
+            main_wager=float(wager),
+            side_bet_limits=limits,
+        )
+        br = float(player.bankroll)
+        bb_lo, bb_hi = limits.get(SIDE_BET_BLOCK_BONUS, (0.0, 0.0))
+        raw_bb = float(proposed.get(SIDE_BET_BLOCK_BONUS, 0) or 0)
+        bb = _validated_side_stake(raw_bb, br, bb_lo, bb_hi)
+        lq_lo, lq_hi = limits.get(SIDE_BET_LUCKY_QUEENS, (0.0, 0.0))
+        raw_lq = float(proposed.get(SIDE_BET_LUCKY_QUEENS, 0) or 0)
+        lq = _validated_side_stake(raw_lq, br - bb, lq_lo, lq_hi)
+        return bb, lq
 
     def _run_single_round(self, round_number: int) -> None:
         bet_min_f = float(self._master.bet_min)
@@ -192,7 +218,6 @@ class StandardBlackjackParallelSession:
         if dbg is not None:
             dbg.begin_round(round_number, self._master.deck.cards_remaining())
 
-        # Shared stream: same four starter cards for every strategy this round.
         p0 = self._master._draw_playable_card()  # noqa: SLF001
         p1 = self._master._draw_playable_card()  # noqa: SLF001
         d0 = self._master._draw_playable_card()  # noqa: SLF001
@@ -202,41 +227,49 @@ class StandardBlackjackParallelSession:
         if dbg is not None:
             dbg.set_cloned_tail_remaining(deck_after_initial.cards_remaining())
 
-        outcomes: list[tuple[int, BlackjackBranchOutcome]] = []
+        outcomes: list[tuple[int, LuckyQueensBranchOutcome]] = []
         for player_index, player, wager in active:
-            # Identical deck tail per strategy; each fork draws the same next cards until
-            # its own hand diverges (stand/hit/split/dealer path).
+            bb, lq = self._resolve_side_stakes(player, wager)
             fork = self._master.fork_for_branch(deck_after_initial)
-            outcome = fork.play_strategy_branch(
+            lq_out = fork.play_strategy_branch_with_side_bets(
                 player,
                 wager,
                 (p0, p1),
                 (d0, d1),
+                block_bonus_stake=bb,
+                lucky_queens_stake=lq,
                 branch_debug=dbg,
             )
-            outcomes.append((player_index, outcome))
+            outcomes.append((player_index, lq_out))
             self._rounds_played[player_index] += 1
-            w, l, p_ct = Blackjack.tally_round_wlp(outcome.final_state)
+            w, l_ct, p_ct = Blackjack.tally_round_wlp(lq_out.blackjack.final_state)
             self._wins[player_index] += w
-            self._losses[player_index] += l
+            self._losses[player_index] += l_ct
             self._pushes[player_index] += p_ct
+            self._block_net[player_index] += (
+                lq_out.block_bonus_chips_returned - lq_out.block_bonus_stake
+            )
+            self._lq_net[player_index] += (
+                lq_out.lucky_queens_chips_returned - lq_out.lucky_queens_stake
+            )
 
-        # Deepest penetration = smallest cards_remaining() on the cloned shoe.
         deepest_idx = 0
-        fewest_remaining = outcomes[0][1].final_deck.cards_remaining()
+        fewest_remaining = outcomes[0][1].blackjack.final_deck.cards_remaining()
         for j in range(1, len(outcomes)):
-            rem = outcomes[j][1].final_deck.cards_remaining()
+            rem = outcomes[j][1].blackjack.final_deck.cards_remaining()
             if rem < fewest_remaining:
                 fewest_remaining = rem
                 deepest_idx = j
 
-        canonical_dealt = outcomes[deepest_idx][1].dealt_sequence
-        canonical_slug = outcomes[deepest_idx][1].slug_triggered
-        self._master.deck = copy.deepcopy(outcomes[deepest_idx][1].final_deck)
+        canonical_dealt = outcomes[deepest_idx][1].blackjack.dealt_sequence
+        canonical_slug = outcomes[deepest_idx][1].blackjack.slug_triggered
+        self._master.deck = copy.deepcopy(outcomes[deepest_idx][1].blackjack.final_deck)
 
-        for _j, (player_index, outcome) in enumerate(outcomes):
+        for _j, (player_index, lq_out) in enumerate(outcomes):
             player = self._players[player_index]
-            suffix = canonical_exposure_suffix(outcome.dealt_sequence, canonical_dealt)
+            suffix = canonical_exposure_suffix(
+                lq_out.blackjack.dealt_sequence, canonical_dealt
+            )
             player.strategy.on_post_round_exposure(suffix)
 
         if canonical_slug:

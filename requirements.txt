@@ -1,0 +1,2 @@
+# Optional: simulate CLI bankroll chart (Plotly open-source core is MIT-licensed).
+plotly>=5.18.0

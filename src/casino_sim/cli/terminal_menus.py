@@ -11,7 +11,7 @@ import re
 import sys
 from typing import Sequence
 
-from casino_sim.cli.registry import StrategySpec
+from casino_sim.cli.registry import StrategySpec, strategy_menu_label
 
 try:
     import msvcrt
@@ -85,6 +85,10 @@ def read_key() -> str:
             return "left"
         if arrow == b"M":
             return "right"
+        if arrow == b"H":
+            return "up"
+        if arrow == b"P":
+            return "down"
         return "other"
     if key in {b"\r", b"\n"}:
         return "enter"
@@ -94,6 +98,10 @@ def read_key() -> str:
         return "left"
     if key in {b"d", b"D"}:
         return "right"
+    if key in {b"w", b"W"}:
+        return "up"
+    if key in {b"s", b"S"}:
+        return "down"
     return "other"
 
 
@@ -167,45 +175,47 @@ def select_from_menu(title: str, options: list[tuple[str, str]]) -> str:
             return options[selected][0]
 
 
-def _truncate_label(label: str, max_len: int = 28) -> str:
-    if len(label) <= max_len:
-        return label
-    return label[: max_len - 1] + "…"
+def _cursor_up_clear_lines(line_count: int) -> None:
+    """Move cursor up and clear each line (VT/ANSI). Used to redraw multi-line menus."""
+    if line_count <= 0:
+        return
+    for _ in range(line_count):
+        sys.stdout.write("\033[A\033[K")
 
 
-def _render_strategy_multiselect_line(
+def _render_strategy_multiselect_vertical_lines(
     specs: tuple[StrategySpec, ...],
     selected: set[int],
     cursor: int,
-) -> str:
+) -> list[str]:
+    """One strategy per row so the menu never relies on a single wrapped \\r line."""
     n = len(specs)
-    parts: list[str] = []
+    lines: list[str] = []
 
-    def wrap_cell(core: str, is_cursor: bool, is_chosen: bool) -> str:
+    def fmt_row(text: str, *, is_cursor: bool, is_chosen: bool) -> str:
         if is_cursor:
-            inner = f" {core} "
             if ansi_enabled:
-                return f"{MENU_SEL_OPEN}[{inner}]{MENU_SEL_CLOSE}"
-            return f"[{inner}]"
+                return f"{MENU_SEL_OPEN}> {text}{MENU_SEL_CLOSE}"
+            return f"> {text}"
         if ansi_enabled:
             if is_chosen:
-                return f"{GREEN}{BOLD} {core} {RST}"
-            return f"{MENU_DIM} {core} {RST}"
-        return f"  {core}  "
+                return f"{GREEN}{BOLD}  {text}{RST}"
+            return f"{MENU_DIM}  {text}{RST}"
+        return f"  {text}"
 
     for i in range(n):
         tag = "[+]" if i in selected else "[ ]"
-        lab = _truncate_label(specs[i].label)
+        lab = strategy_menu_label(specs[i])
         core = f"{tag} {lab}"
-        parts.append(wrap_cell(core, cursor == i, i in selected))
+        lines.append(fmt_row(core, is_cursor=cursor == i, is_chosen=i in selected))
 
-    all_lab = "All strategies"
-    parts.append(wrap_cell(all_lab, cursor == n, False))
-
-    conf_lab = "Confirm"
-    parts.append(wrap_cell(conf_lab, cursor == n + 1, False))
-
-    return " | ".join(parts)
+    lines.append(
+        fmt_row("All strategies", is_cursor=cursor == n, is_chosen=False)
+    )
+    lines.append(
+        fmt_row("Confirm selection", is_cursor=cursor == n + 1, is_chosen=False)
+    )
+    return lines
 
 
 def select_strategy_indices_multimenu_fallback(
@@ -213,7 +223,7 @@ def select_strategy_indices_multimenu_fallback(
 ) -> list[int]:
     print("\n--- Strategies ---")
     for i, s in enumerate(specs, start=1):
-        print(f"  {i}) {s.label}")
+        print(f"  {i}) {strategy_menu_label(s)}")
     n = len(specs)
     while True:
         raw = input(
@@ -242,7 +252,7 @@ def select_strategy_indices_multimenu_fallback(
 def select_strategy_indices_multimenu(
     specs: tuple[StrategySpec, ...],
 ) -> list[int]:
-    """Return 0-based indices of strategies to run. ``specs`` may not be empty."""
+    """Return 0-based indices of strategies to run. Empty ``specs`` → empty list."""
     n = len(specs)
     if n == 0:
         return []
@@ -251,12 +261,12 @@ def select_strategy_indices_multimenu(
 
     title = f"{CYAN}{BOLD}Select strategies to simulate{RST}" if ansi_enabled else "Select strategies to simulate"
     hint = (
-        f"{DIM}LEFT/RIGHT move · SPACE toggles strategy · ENTER on All runs all · "
-        f"ENTER on Confirm runs selection (needs ≥1).{RST}"
+        f"{DIM}UP/DOWN or W/S (also LEFT/RIGHT) · SPACE toggles · ENTER on \"All strategies\" "
+        f"runs all · ENTER on \"Confirm selection\" (needs >= 1).{RST}"
         if ansi_enabled
         else (
-            "LEFT/RIGHT move · SPACE toggles strategy · ENTER on All runs all · "
-            "ENTER on Confirm runs selection (needs ≥1)."
+            'UP/DOWN or W/S (also LEFT/RIGHT) · SPACE toggles · ENTER on "All strategies" '
+            'runs all · ENTER on "Confirm selection" (needs >= 1).'
         )
     )
     print(f"\n{title}")
@@ -265,20 +275,21 @@ def select_strategy_indices_multimenu(
     selected: set[int] = set()
     cursor = 0
     total_slots = n + 2
-    last_visible_len = 0
+    prev_block_height = 0
 
     while True:
-        line = _render_strategy_multiselect_line(specs, selected, cursor)
-        padding = max(0, last_visible_len - visible_len(line))
-        sys.stdout.write("\r" + line + (" " * padding))
-        sys.stdout.flush()
-        last_visible_len = visible_len(line)
+        block_lines = _render_strategy_multiselect_vertical_lines(specs, selected, cursor)
+        if prev_block_height > 0:
+            _cursor_up_clear_lines(prev_block_height)
+        for ln in block_lines:
+            print(ln)
+        prev_block_height = len(block_lines)
 
         key = read_key()
-        if key == "left":
+        if key in ("left", "up"):
             cursor = (cursor - 1) % total_slots
             continue
-        if key == "right":
+        if key in ("right", "down"):
             cursor = (cursor + 1) % total_slots
             continue
         if key == "space" or (key == "enter" and cursor < n):
